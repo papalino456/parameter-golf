@@ -19,6 +19,7 @@ import uuid
 import zlib
 from pathlib import Path
 
+
 import numpy as np
 import sentencepiece as spm
 import torch
