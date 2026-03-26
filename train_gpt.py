@@ -98,6 +98,9 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_adapter_rank = int(os.environ.get("TTT_ADAPTER_RANK", 16))
+    ttt_adapter_last_n = int(os.environ.get("TTT_ADAPTER_LAST_N", 4))
+    ttt_adapter_only = bool(int(os.environ.get("TTT_ADAPTER_ONLY", "1")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -729,6 +732,23 @@ class MLP(nn.Module):
         x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
         return F.linear(x.square(), down_w.to(x.dtype))
 
+
+class TTTAdapter(nn.Module):
+    """Small residual bottleneck meant to be cheaply updated during legal TTT."""
+    def __init__(self, dim: int, rank: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.down = CastedLinear(dim, rank, bias=False)
+        self.up = CastedLinear(rank, dim, bias=False)
+        self.up._zero_init = True
+        nn.init.orthogonal_(self.down.weight)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.down(self.norm(x))
+        h = F.silu(h)
+        return self.up(h)
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -743,6 +763,7 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        ttt_adapter_rank: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -750,6 +771,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         gated_attention=gated_attention, value_residual=value_residual)
         self.mlp = MLP(dim, mlp_mult)
+        self.ttt_adapter = TTTAdapter(dim, ttt_adapter_rank) if ttt_adapter_rank > 0 else None
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -766,6 +788,8 @@ class Block(nn.Module):
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        if self.ttt_adapter is not None:
+            x_out = x_out + self.ttt_adapter(x_out)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -798,6 +822,8 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        ttt_adapter_rank: int = 0,
+        ttt_adapter_last_n: int = 0,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -825,6 +851,7 @@ class GPT(nn.Module):
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        adapter_start = max(0, num_layers - max(ttt_adapter_last_n, 0))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -839,10 +866,12 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    ttt_adapter_rank=ttt_adapter_rank if ttt_adapter_rank > 0 and i >= adapter_start else 0,
                 )
                 for i in range(num_layers)
             ]
         )
+        self.ttt_adapter_layers = [i for i, block in enumerate(self.blocks) if block.ttt_adapter is not None]
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
@@ -1107,25 +1136,32 @@ def eval_val_sliding_ttt(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    # Freeze first N blocks
+    adapter_only = args.ttt_adapter_only and any(".ttt_adapter." in name for name, _p in base_model.named_parameters())
+    # Freeze first N blocks, or everything except adapters when adapter-only TTT is enabled.
     frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
     ttt_params = []
     for name, p in base_model.named_parameters():
-        freeze = False
-        for bi in frozen_block_ids:
-            if f"blocks.{bi}." in name:
-                freeze = True
-                break
-        if freeze:
+        block_idx = None
+        if name.startswith("blocks."):
+            parts = name.split(".", 2)
+            if len(parts) >= 2 and parts[1].isdigit():
+                block_idx = int(parts[1])
+        is_frozen_block = block_idx in frozen_block_ids if block_idx is not None else False
+        is_adapter_param = ".ttt_adapter." in name
+        trainable = is_adapter_param if adapter_only else not is_frozen_block
+        if is_frozen_block:
+            trainable = False
+        if not trainable:
             p.requires_grad_(False)
         else:
             p.requires_grad_(True)
             ttt_params.append(p)
 
-    log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
+    log0(f"ttt_sliding:mode={'adapter_only' if adapter_only else 'full_model'} "
+         f"params unfrozen={sum(p.numel() for p in ttt_params)} "
          f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
 
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum) if ttt_params else None
     t0 = time.perf_counter()
 
     for ci in range(num_chunks):
@@ -1174,7 +1210,7 @@ def eval_val_sliding_ttt(
 
         # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
-        if not is_last_chunk and args.ttt_epochs > 0:
+        if not is_last_chunk and args.ttt_epochs > 0 and optimizer is not None:
             base_model.train()
             chunk_seqs = (chunk_end - chunk_start) // seq_len
             if chunk_seqs > 0:
@@ -1479,6 +1515,8 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        ttt_adapter_rank=args.ttt_adapter_rank,
+        ttt_adapter_last_n=args.ttt_adapter_last_n,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1504,10 +1542,15 @@ def main() -> None:
         base_model.mlp_up_bank, base_model.mlp_down_bank,
     ]
     block_named_params = list(base_model.blocks.named_parameters())
+    adapter_matrix_params = [
+        p for name, p in block_named_params
+        if ".ttt_adapter." in name and p.ndim >= 2
+    ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (".ttt_adapter." in name and p.ndim < 2)
+        or (".ttt_adapter." not in name and (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1550,11 +1593,21 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
+    optimizer_adapter = None
+    if adapter_matrix_params:
+        optimizer_adapter = torch.optim.AdamW(
+            [{"params": adapter_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.adam_wd,
+            fused=True,
+        )
     # Non-bank params that need manual all-reduce (replicated across GPUs)
     replicated_params = list(optimizer_tok.param_groups[0]["params"])
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
+    replicated_params.extend(adapter_matrix_params)
 
     optimizer_head = None
     if base_model.lm_head is not None:
@@ -1566,12 +1619,18 @@ def main() -> None:
         )
         replicated_params.append(base_model.lm_head.weight)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if optimizer_adapter is not None:
+        optimizers.append(optimizer_adapter)
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
+    ttt_adapter_params = sum(p.numel() for p in adapter_matrix_params)
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
+    log0(f"ttt_adapter:rank:{args.ttt_adapter_rank} last_n:{args.ttt_adapter_last_n} "
+         f"active_layers:{base_model.ttt_adapter_layers} params:{ttt_adapter_params} "
+         f"adapter_only_ttt:{args.ttt_adapter_only}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1822,6 +1881,7 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        ttt_adapter_rank=args.ttt_adapter_rank, ttt_adapter_last_n=args.ttt_adapter_last_n,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
