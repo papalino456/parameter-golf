@@ -90,6 +90,7 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    value_mixer = bool(int(os.environ.get("VALUE_MIXER", "1")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -364,7 +365,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,value_mix",
     ).split(",")
     if pattern
 )
@@ -599,6 +600,27 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
+class GroupedValueMixer(nn.Module):
+    def __init__(self, num_heads: int, num_kv_heads: int):
+        super().__init__()
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.group_size = num_heads // num_kv_heads
+        self.value_mix_local = nn.Parameter(torch.zeros(num_kv_heads, self.group_size, self.group_size, dtype=torch.float32))
+        self.value_mix_global = nn.Parameter(torch.zeros(num_kv_heads, num_kv_heads, dtype=torch.float32))
+        self.value_mix_scale = nn.Parameter(torch.tensor([0.10, 0.05], dtype=torch.float32))
+    def forward(self, y: Tensor) -> Tensor:
+        bsz, seqlen, _, head_dim = y.shape
+        y_grouped = y.reshape(bsz, seqlen, self.num_kv_heads, self.group_size, head_dim)
+        local = torch.einsum("btkgd,kgm->btkmd", y_grouped, self.value_mix_local.to(dtype=y.dtype))
+        group_summary = y_grouped.mean(dim=3)
+        global_mix = torch.einsum("btkd,km->btmd", group_summary, self.value_mix_global.to(dtype=y.dtype))
+        scales = self.value_mix_scale.to(dtype=y.dtype)
+        y_grouped = y_grouped + scales[0] * local + scales[1] * global_mix.unsqueeze(3)
+        return y_grouped.reshape(bsz, seqlen, self.num_heads, head_dim)
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -609,6 +631,7 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         gated_attention: bool = False,
         value_residual: bool = False,
+        value_mixer: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -634,6 +657,7 @@ class CausalSelfAttention(nn.Module):
         self.value_residual = value_residual
         if value_residual:
             self.vr_lambda = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
+        self.value_mixer = GroupedValueMixer(num_heads, num_kv_heads) if value_mixer else None
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Efficient XSA: subtract self-value projection via GQA-aware reshape (no repeat_interleave).
         y: [B, T, H, D], v: [B, T, Hkv, D]. H must be divisible by Hkv."""
@@ -665,6 +689,8 @@ class CausalSelfAttention(nn.Module):
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
+        if self.value_mixer is not None:
+            y = self.value_mixer(y)
         if self.gated_attention:
             # gate shape: (bsz, seqlen, num_heads) -> (bsz, seqlen, num_heads, 1) for B,T,H,D layout
             gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)
@@ -743,12 +769,14 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        value_mixer: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        gated_attention=gated_attention, value_residual=value_residual)
+                                        gated_attention=gated_attention, value_residual=value_residual,
+                                        value_mixer=value_mixer)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -798,6 +826,7 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        value_mixer: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -839,6 +868,7 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    value_mixer=value_mixer,
                 )
                 for i in range(num_layers)
             ]
@@ -1479,6 +1509,7 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        value_mixer=args.value_mixer,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1574,6 +1605,7 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    log0(f"value_path:ve={args.ve_enabled} value_residual={args.value_residual} value_mixer={args.value_mixer}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1822,6 +1854,7 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        value_mixer=args.value_mixer,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
