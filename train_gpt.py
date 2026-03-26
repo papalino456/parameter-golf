@@ -81,6 +81,7 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    mixer_kernel = int(os.environ.get("MIXER_KERNEL", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
@@ -681,6 +682,20 @@ class SmearGate(nn.Module):
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         return (1 - g) * x + g * x_prev
 
+class CausalTokenMixer(nn.Module):
+    def __init__(self, kernel_size: int):
+        super().__init__()
+        self.kernel_size = kernel_size
+    def forward(self, x: Tensor, kernel: Tensor) -> Tensor:
+        if self.kernel_size <= 0:
+            return torch.zeros_like(x)
+        mixed = torch.zeros_like(x)
+        taps = kernel.to(dtype=x.dtype)
+        for shift in range(self.kernel_size):
+            shifted = F.pad(x, (0, 0, shift + 1, 0))[:, : x.size(1), :]
+            mixed = mixed + shifted * taps[:, shift][None, None, :]
+        return mixed * (1.0 / math.sqrt(self.kernel_size))
+
 class BigramHashEmbedding(nn.Module):
     def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
         super().__init__()
@@ -746,9 +761,11 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
+        self.mixer_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         gated_attention=gated_attention, value_residual=value_residual)
+        self.token_mixer = CausalTokenMixer(kernel_size=0)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -760,11 +777,12 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, mix_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        mix_out = self.token_mixer(self.mixer_norm(x_in) * self.ln_scale_factor, mix_w)
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * (attn_out + mix_out)
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
@@ -790,6 +808,7 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
+        mixer_kernel: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
         dtg: bool = False,
@@ -800,6 +819,8 @@ class GPT(nn.Module):
         value_residual: bool = False,
     ):
         super().__init__()
+        if mixer_kernel <= 0:
+            raise ValueError(f"mixer_kernel must be positive, got {mixer_kernel}")
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -823,6 +844,7 @@ class GPT(nn.Module):
         self.num_layers = num_layers
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
+        self.mixer_bank = nn.Parameter(torch.empty(num_layers, model_dim, mixer_kernel))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
         self.blocks = nn.ModuleList(
@@ -843,6 +865,8 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        for block in self.blocks:
+            block.token_mixer = CausalTokenMixer(mixer_kernel)
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
@@ -883,6 +907,7 @@ class GPT(nn.Module):
             nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
             nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
+            nn.init.zeros_(self.mixer_bank.data[i])                     # Causal token mixer
             nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
             nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
@@ -919,7 +944,7 @@ class GPT(nn.Module):
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[n + i], self.mixer_bank[i], self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -931,7 +956,7 @@ class GPT(nn.Module):
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[n + bi], self.mixer_bank[bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -977,7 +1002,7 @@ class GPT(nn.Module):
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                self.qo_bank[n + i], self.mixer_bank[i], self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -989,7 +1014,7 @@ class GPT(nn.Module):
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                self.qo_bank[n + bi], self.mixer_bank[bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1234,6 +1259,8 @@ def eval_val_sliding_ttt(
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
+    if ".token_mixer." in name:
+        return "attn"
     if ".mlp." in name:
         return "mlp"
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
@@ -1273,6 +1300,9 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
             for i in range(n):
                 out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
                 out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
+        elif name == "mixer_bank":
+            for i in range(n):
+                out[f"blocks.{i}.token_mixer.weight"] = tensor[i]
         elif name == "mlp_up_bank":
             for i in range(n):
                 out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
@@ -1290,6 +1320,7 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
     # Reconstruct banks from individual weight keys
     qo_slices = [None] * (2 * n)
     kv_slices = [None] * (2 * n)
+    mixer_slices = [None] * n
     up_slices = [None] * n
     down_slices = [None] * n
     consumed = set()
@@ -1310,6 +1341,10 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
         if vk in sd:
             kv_slices[n + i] = sd[vk]
             consumed.add(vk)
+        mk = f"blocks.{i}.token_mixer.weight"
+        if mk in sd:
+            mixer_slices[i] = sd[mk]
+            consumed.add(mk)
         fk = f"blocks.{i}.mlp.fc.weight"
         if fk in sd:
             up_slices[i] = sd[fk]
@@ -1320,6 +1355,7 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
             consumed.add(dk)
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
+    out["mixer_bank"] = torch.stack(mixer_slices).to(dtype=template_sd["mixer_bank"].dtype)
     out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
     out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
     for name, tensor in sd.items():
@@ -1471,6 +1507,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
+        mixer_kernel=args.mixer_kernel,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
         dtg=args.dtg_enabled,
@@ -1483,6 +1520,7 @@ def main() -> None:
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
+    base_model.mixer_bank.data = base_model.mixer_bank.data.float()
     base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
     base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
     for module in base_model.modules():
@@ -1501,6 +1539,7 @@ def main() -> None:
     # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
     matrix_params = [
         base_model.qo_bank, base_model.kv_bank,
+        base_model.mixer_bank,
         base_model.mlp_up_bank, base_model.mlp_down_bank,
     ]
     block_named_params = list(base_model.blocks.named_parameters())
@@ -1574,6 +1613,7 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    log0(f"token_mixer:causal_fir kernel:{args.mixer_kernel}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1819,12 +1859,14 @@ def main() -> None:
         mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
+        mixer_kernel=args.mixer_kernel,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
+    eval_model.mixer_bank.data = eval_model.mixer_bank.data.float()
     eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
     eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
     for m in eval_model.modules():
