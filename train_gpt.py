@@ -364,7 +364,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,resid_router,skip_router,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
     ).split(",")
     if pattern
 )
@@ -721,6 +721,15 @@ class ValueEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 
+class TokenRouter(nn.Module):
+    def __init__(self, dim: int, out_dim: int, bias: float = 0.0):
+        super().__init__()
+        self.proj = nn.Linear(dim, out_dim, bias=True)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.constant_(self.proj.bias, bias)
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(F.rms_norm(x, (x.size(-1),)))
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
@@ -752,7 +761,8 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.resid_mix = nn.Parameter(torch.tensor([3.0, -3.0], dtype=torch.float32))
+        self.resid_router = TokenRouter(dim, 2)
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
@@ -761,8 +771,9 @@ class Block(nn.Module):
         else:
             self.dtg_gate = None
     def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        mix_logits = self.resid_mix.to(dtype=x.dtype)[None, None, :] + self.resid_router(x - x0).to(dtype=x.dtype)
+        mix = F.softmax(mix_logits, dim=-1)
+        x_in = mix[..., :1] * x + mix[..., 1:] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
@@ -816,6 +827,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_router = nn.ModuleList([TokenRouter(model_dim, 1) for _ in range(self.num_skip_weights)])
         # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
@@ -927,7 +939,9 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip = skips.pop()
+                skip_gate = (2.0 * torch.sigmoid(self.skip_router[i](x - skip))).to(dtype=x.dtype)
+                x = x + skip_gate * self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
@@ -985,7 +999,9 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                skip = skips.pop()
+                skip_gate = (2.0 * torch.sigmoid(self.skip_router[i](x - skip))).to(dtype=x.dtype)
+                x = x + skip_gate * self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
@@ -1511,6 +1527,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+        scalar_params.extend(base_model.skip_router.parameters())
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
