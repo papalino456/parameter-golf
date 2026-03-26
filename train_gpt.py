@@ -722,12 +722,14 @@ class ValueEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
         # No CastedLinear -- weights come from banks
     def forward(self, x: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
-        x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
-        return F.linear(x.square(), down_w.to(x.dtype))
+        value_w, gate_w = up_w.chunk(2, dim=0)
+        value = F.linear(x, value_w.to(x.dtype))
+        gate = F.linear(x, gate_w.to(x.dtype))
+        return F.linear(value * F.silu(gate), down_w.to(x.dtype))
 
 class Block(nn.Module):
     def __init__(
@@ -735,7 +737,7 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         rope_base: float,
         qk_gain_init: float,
         layer_idx: int = 0,
@@ -779,7 +781,7 @@ class GPT(nn.Module):
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -819,12 +821,12 @@ class GPT(nn.Module):
         # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
-        mlp_dim = int(mlp_mult * model_dim)
+        mlp_hidden_dim = max(1, int(round((2.0 * mlp_mult * model_dim) / 3.0)))
         self.num_layers = num_layers
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
-        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, 2 * mlp_hidden_dim, model_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_hidden_dim))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -883,7 +885,9 @@ class GPT(nn.Module):
             nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
             nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
+            up_value, up_gate = self.mlp_up_bank.data[i].chunk(2, dim=0)
+            nn.init.orthogonal_(up_value, gain=1.0)                    # MLP value
+            nn.init.orthogonal_(up_gate, gain=1.0)                     # MLP gate
             nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
