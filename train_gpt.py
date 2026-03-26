@@ -80,6 +80,8 @@ class Hyperparameters:
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    trigram_vocab_size = int(os.environ.get("TRIGRAM_VOCAB_SIZE", 1024))
+    trigram_dim = int(os.environ.get("TRIGRAM_DIM", 64))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -364,7 +366,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,ngram.scale,path_scales",
     ).split(",")
     if pattern
 )
@@ -681,25 +683,61 @@ class SmearGate(nn.Module):
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         return (1 - g) * x + g * x_prev
 
-class BigramHashEmbedding(nn.Module):
-    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+class DualNgramHashEmbedding(nn.Module):
+    def __init__(
+        self,
+        bigram_vocab_size: int,
+        trigram_vocab_size: int,
+        bigram_dim: int,
+        trigram_dim: int,
+        model_dim: int,
+    ):
         super().__init__()
         self.bigram_vocab_size = bigram_vocab_size
-        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
-        nn.init.zeros_(self.embed.weight)
-        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        self.trigram_vocab_size = trigram_vocab_size
+        self.bigram_embed = nn.Embedding(bigram_vocab_size, bigram_dim) if bigram_vocab_size > 0 and bigram_dim > 0 else None
+        self.trigram_embed = nn.Embedding(trigram_vocab_size, trigram_dim) if trigram_vocab_size > 0 and trigram_dim > 0 else None
+        if self.bigram_embed is not None:
+            nn.init.zeros_(self.bigram_embed.weight)
+        if self.trigram_embed is not None:
+            nn.init.zeros_(self.trigram_embed.weight)
+        total_dim = (bigram_dim if self.bigram_embed is not None else 0) + (trigram_dim if self.trigram_embed is not None else 0)
+        self.proj = CastedLinear(total_dim, model_dim, bias=False) if total_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
+        self.path_scales = nn.Parameter(torch.ones(2, dtype=torch.float32))
         self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
     def bigram_hash(self, tokens: Tensor) -> Tensor:
-        t = tokens.to(torch.int32)
+        if self.bigram_vocab_size <= 1:
+            return torch.zeros_like(tokens, dtype=torch.long)
+        t = tokens.to(torch.int64)
         mod = self.bigram_vocab_size - 1
         out = torch.empty_like(t)
         out[..., 0] = mod
         out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
         return out.long()
+    def trigram_hash(self, tokens: Tensor) -> Tensor:
+        if self.trigram_vocab_size <= 2:
+            return torch.zeros_like(tokens, dtype=torch.long)
+        t = tokens.to(torch.int64)
+        mod = self.trigram_vocab_size - 2
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        if t.size(-1) > 1:
+            out[..., 1] = mod + 1
+        if t.size(-1) > 2:
+            mix = 12582917 * t[..., 2:] + 40507 * t[..., 1:-1] + 70937 * t[..., :-2]
+            out[..., 2:] = torch.bitwise_xor(mix, 131071 * t[..., 1:-1]) % mod
+        return out.long()
     def forward(self, token_ids: Tensor) -> Tensor:
-        h = self.embed(self.bigram_hash(token_ids))
+        features: list[Tensor] = []
+        if self.bigram_embed is not None:
+            bigram = self.bigram_embed(self.bigram_hash(token_ids))
+            features.append(bigram * self.path_scales[0].to(dtype=bigram.dtype))
+        if self.trigram_embed is not None:
+            trigram = self.trigram_embed(self.trigram_hash(token_ids))
+            features.append(trigram * self.path_scales[1].to(dtype=trigram.dtype))
+        h = features[0] if len(features) == 1 else torch.cat(features, dim=-1)
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
@@ -789,6 +827,8 @@ class GPT(nn.Module):
         mtp_loss_weight: float = 0.1,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        trigram_vocab_size: int = 0,
+        trigram_dim: int = 64,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
@@ -810,7 +850,11 @@ class GPT(nn.Module):
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.ngram = (
+            DualNgramHashEmbedding(bigram_vocab_size, trigram_vocab_size, bigram_dim, trigram_dim, model_dim)
+            if bigram_vocab_size > 0 or trigram_vocab_size > 0
+            else None
+        )
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -888,7 +932,7 @@ class GPT(nn.Module):
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
             self.mlp_down_bank.data[i].mul_(proj_scale)
-        # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
+        # Init remaining nn.Linear modules (ngram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -907,8 +951,8 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         n = self.num_layers
         x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
+        if self.ngram is not None:
+            x = x + self.ngram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -965,8 +1009,8 @@ class GPT(nn.Module):
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         n = self.num_layers
         x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
+        if self.ngram is not None:
+            x = x + self.ngram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -1470,6 +1514,8 @@ def main() -> None:
         mtp_loss_weight=args.mtp_loss_weight,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        trigram_vocab_size=args.trigram_vocab_size,
+        trigram_dim=args.trigram_dim,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
@@ -1498,7 +1544,7 @@ def main() -> None:
     # - 4 parameter banks -> Muon (batched Newton-Schulz)
     # - token embedding -> Adam
     # - scalars/control tensors -> Adam
-    # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
+    # - ngram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
     matrix_params = [
         base_model.qo_bank, base_model.kv_bank,
         base_model.mlp_up_bank, base_model.mlp_down_bank,
@@ -1512,14 +1558,18 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
-    if base_model.bigram is not None:
-        scalar_params.append(base_model.bigram.scale)
+    if base_model.ngram is not None:
+        scalar_params.append(base_model.ngram.scale)
+        scalar_params.append(base_model.ngram.path_scales)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
-    if base_model.bigram is not None:
-        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.bigram.proj is not None:
-            scalar_params.append(base_model.bigram.proj.weight)
+    if base_model.ngram is not None:
+        if base_model.ngram.bigram_embed is not None:
+            tok_params.append({"params": [base_model.ngram.bigram_embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.ngram.trigram_embed is not None:
+            tok_params.append({"params": [base_model.ngram.trigram_embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.ngram.proj is not None:
+            scalar_params.append(base_model.ngram.proj.weight)
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
@@ -1572,6 +1622,10 @@ def main() -> None:
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
+    log0(
+        f"ngram_path:bigram_vocab:{args.bigram_vocab_size} bigram_dim:{args.bigram_dim} "
+        f"trigram_vocab:{args.trigram_vocab_size} trigram_dim:{args.trigram_dim}"
+    )
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1818,6 +1872,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        trigram_vocab_size=args.trigram_vocab_size, trigram_dim=args.trigram_dim,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
