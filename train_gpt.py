@@ -51,6 +51,7 @@ class Hyperparameters:
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_gate_init = float(os.environ.get("ROPE_GATE_INIT", 3.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -364,7 +365,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,rope_gate",
     ).split(",")
     if pattern
 )
@@ -588,7 +589,18 @@ class Rotary(nn.Module):
             self._sin_cached = freqs.sin()[None, :, None, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
+def apply_rotary_emb(
+    x: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    rope_dims: int = 0,
+    freq_gate: Tensor | None = None,
+) -> Tensor:
+    if freq_gate is not None:
+        gate = torch.sigmoid(freq_gate).to(dtype=x.dtype)
+        gate = gate[None, None, None, :] if gate.ndim == 1 else gate[None, None, :, :]
+        cos = gate * cos + (1.0 - gate)
+        sin = gate * sin
     if rope_dims > 0 and rope_dims < x.size(-1):
         x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
         half = rope_dims // 2
@@ -607,6 +619,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
+        rope_gate_init: float = 3.0,
         gated_attention: bool = False,
         value_residual: bool = False,
     ):
@@ -620,10 +634,16 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        active_rope_dims = rope_dims if rope_dims > 0 else self.head_dim
+        if active_rope_dims > self.head_dim or active_rope_dims % 2 != 0:
+            raise ValueError("rope_dims must be even and <= head_dim")
         # No CastedLinear -- weights come from banks
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rope_dims = 0  # set by GPT.__init__ for partial RoPE
-        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
+        self.rope_dims = active_rope_dims
+        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024, rope_dims=active_rope_dims)
+        rope_pairs = active_rope_dims // 2
+        self.q_rope_gate = nn.Parameter(torch.full((num_heads, rope_pairs), rope_gate_init, dtype=torch.float32))
+        self.k_rope_gate = nn.Parameter(torch.full((num_kv_heads, rope_pairs), rope_gate_init, dtype=torch.float32))
         self.use_xsa = False  # set by GPT.__init__ for deep layers only
         # Gated attention and value residual (non-banked small params)
         self.gated_attention = gated_attention
@@ -659,8 +679,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
-        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
+        q = apply_rotary_emb(q, cos, sin, self.rope_dims, self.q_rope_gate)
+        k = apply_rotary_emb(k, cos, sin, self.rope_dims, self.k_rope_gate)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
@@ -738,6 +758,8 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
+        rope_gate_init: float = 3.0,
         layer_idx: int = 0,
         ln_scale: bool = False,
         dtg: bool = False,
@@ -748,6 +770,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        rope_dims=rope_dims, rope_gate_init=rope_gate_init,
                                         gated_attention=gated_attention, value_residual=value_residual)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -791,6 +814,7 @@ class GPT(nn.Module):
         bigram_dim: int = 128,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
+        rope_gate_init: float = 3.0,
         ln_scale: bool = False,
         dtg: bool = False,
         ve_enabled: bool = False,
@@ -834,6 +858,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    rope_dims=rope_dims,
+                    rope_gate_init=rope_gate_init,
                     layer_idx=i,
                     ln_scale=ln_scale,
                     dtg=dtg,
@@ -843,11 +869,6 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        if rope_dims > 0:
-            head_dim = model_dim // num_heads
-            for block in self.blocks:
-                block.attn.rope_dims = rope_dims
-                block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
         kv_dim_ve = self._ve_target_dim
         if self.ve_layer_indices:
@@ -1472,6 +1493,7 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
+        rope_gate_init=args.rope_gate_init,
         ln_scale=args.ln_scale,
         dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled,
@@ -1577,6 +1599,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"position_mode:rope_hybrid rope_dims:{args.rope_dims} rope_gate_init:{args.rope_gate_init}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1819,7 +1842,8 @@ def main() -> None:
         mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
-        rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+        rope_dims=args.rope_dims, rope_gate_init=args.rope_gate_init,
+        ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
     ).to(device).bfloat16()
