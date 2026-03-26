@@ -90,6 +90,9 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    summary_memory = bool(int(os.environ.get("SUMMARY_MEMORY", "1")))
+    summary_dim = int(os.environ.get("SUMMARY_DIM", 64))
+    summary_init = float(os.environ.get("SUMMARY_INIT", 0.1))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -721,6 +724,27 @@ class ValueEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 
+class SequenceSummaryMemory(nn.Module):
+    """Compact causal memory built from the prefix-mean of earlier hidden states."""
+    def __init__(self, model_dim: int, summary_dim: int, init_scale: float):
+        super().__init__()
+        self.down = CastedLinear(model_dim, summary_dim, bias=False)
+        self.up = CastedLinear(summary_dim, model_dim, bias=False) if summary_dim != model_dim else None
+        self.scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
+        nn.init.orthogonal_(self.down.weight)
+        if self.up is not None:
+            nn.init.orthogonal_(self.up.weight)
+    def forward(self, x: Tensor) -> Tensor:
+        summary = self.down(F.rms_norm(x, (x.size(-1),)))
+        prefix = torch.cumsum(summary, dim=1) - summary
+        counts = torch.arange(summary.size(1), device=summary.device, dtype=torch.float32)
+        counts = counts.clamp_min_(1.0).view(1, -1, 1).to(dtype=summary.dtype)
+        summary = prefix / counts
+        summary = F.rms_norm(summary, (summary.size(-1),))
+        if self.up is not None:
+            summary = self.up(summary)
+        return summary * self.scale.to(dtype=summary.dtype)
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
@@ -798,6 +822,9 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        summary_memory: bool = True,
+        summary_dim: int = 64,
+        summary_init: float = 0.1,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -816,6 +843,12 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.summary_memory = SequenceSummaryMemory(model_dim, summary_dim, summary_init) if summary_memory and self.num_decoder_layers > 0 else None
+        self.summary_layer_gains = (
+            nn.Parameter(torch.ones(self.num_decoder_layers, dtype=torch.float32))
+            if self.summary_memory is not None
+            else nn.Parameter(torch.empty(0, dtype=torch.float32))
+        )
         # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
@@ -924,10 +957,13 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+        summary_residual = self.summary_memory(x) if self.summary_memory is not None else None
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            if summary_residual is not None:
+                x = x + self.summary_layer_gains[i].to(dtype=x.dtype) * summary_residual
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
@@ -982,10 +1018,13 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+        summary_residual = self.summary_memory(x) if self.summary_memory is not None else None
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            if summary_residual is not None:
+                x = x + self.summary_layer_gains[i].to(dtype=x.dtype) * summary_residual
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
@@ -1479,6 +1518,9 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        summary_memory=args.summary_memory,
+        summary_dim=args.summary_dim,
+        summary_init=args.summary_init,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1527,6 +1569,12 @@ def main() -> None:
         scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
+    if base_model.summary_memory is not None:
+        scalar_params.append(base_model.summary_memory.down.weight)
+        if base_model.summary_memory.up is not None:
+            scalar_params.append(base_model.summary_memory.up.weight)
+        scalar_params.append(base_model.summary_memory.scale)
+        scalar_params.append(base_model.summary_layer_gains)
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -1574,6 +1622,11 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    log0(
+        f"summary_memory:{base_model.summary_memory is not None} "
+        f"summary_dim:{args.summary_dim if base_model.summary_memory is not None else 0} "
+        f"summary_init:{args.summary_init:.3f}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1822,6 +1875,7 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        summary_memory=args.summary_memory, summary_dim=args.summary_dim, summary_init=args.summary_init,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
