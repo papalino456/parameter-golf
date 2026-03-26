@@ -90,6 +90,7 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    shared_depth_cores = int(os.environ.get("SHARED_DEPTH_CORES", 4))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -798,6 +799,7 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        shared_depth_cores: int = 0,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -821,10 +823,11 @@ class GPT(nn.Module):
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
         self.num_layers = num_layers
-        self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
-        self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
-        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        self.num_shared_layers = min(num_layers, shared_depth_cores) if shared_depth_cores > 0 else num_layers
+        self.qo_bank = nn.Parameter(torch.empty(2 * self.num_shared_layers, model_dim, model_dim))
+        self.kv_bank = nn.Parameter(torch.empty(2 * self.num_shared_layers, kv_dim, model_dim))
+        self.mlp_up_bank = nn.Parameter(torch.empty(self.num_shared_layers, mlp_dim, model_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(self.num_shared_layers, model_dim, mlp_dim))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -876,17 +879,18 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         n = self.num_layers
+        n_shared = self.num_shared_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
         # Init banks: orthogonal, with proj layers scaled down and out/down zero-init
-        for i in range(n):
+        for i in range(n_shared):
             nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)        # Q
-            nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
+            nn.init.zeros_(self.qo_bank.data[n_shared + i])             # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
-            nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
+            nn.init.orthogonal_(self.kv_bank.data[n_shared + i], gain=1.0)  # V
             nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
             nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
-            self.qo_bank.data[n + i].mul_(proj_scale)
+            self.qo_bank.data[n_shared + i].mul_(proj_scale)
             self.mlp_down_bank.data[i].mul_(proj_scale)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
@@ -895,6 +899,18 @@ class GPT(nn.Module):
                     nn.init.zeros_(module.weight)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
+    def _shared_layer_idx(self, layer_idx: int) -> int:
+        return layer_idx % self.num_shared_layers
+    def _bank_views(self, layer_idx: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        si = self._shared_layer_idx(layer_idx)
+        return (
+            self.qo_bank[si],
+            self.kv_bank[si],
+            self.kv_bank[self.num_shared_layers + si],
+            self.qo_bank[self.num_shared_layers + si],
+            self.mlp_up_bank[si],
+            self.mlp_down_bank[si],
+        )
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -905,7 +921,6 @@ class GPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -916,10 +931,10 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            q_w, k_w, v_w, out_w, up_w, down_w = self._bank_views(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -928,10 +943,10 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            q_w, k_w, v_w, out_w, up_w, down_w = self._bank_views(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -963,7 +978,6 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
-        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -974,10 +988,10 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
+            q_w, k_w, v_w, out_w, up_w, down_w = self._bank_views(i)
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -986,10 +1000,10 @@ class GPT(nn.Module):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            q_w, k_w, v_w, out_w, up_w, down_w = self._bank_views(bi)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                q_w, k_w, v_w, out_w, up_w, down_w,
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1260,33 +1274,35 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
 
-def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
-    """Convert 3D bank tensors into individual 2D tensors with standard names."""
+def _shared_bank_count(sd: dict[str, Tensor]) -> int:
+    return int(sd["mlp_up_bank"].shape[0])
+def _unbank_state_dict(sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Convert 3D bank tensors into shared 2D tensors with standard names."""
     out: dict[str, Tensor] = {}
-    n = num_layers
+    n = _shared_bank_count(sd)
     for name, tensor in sd.items():
         if name == "qo_bank":
             for i in range(n):
-                out[f"blocks.{i}.attn.c_q.weight"] = tensor[i]
-                out[f"blocks.{i}.attn.proj.weight"] = tensor[n + i]
+                out[f"shared_blocks.{i}.attn.c_q.weight"] = tensor[i]
+                out[f"shared_blocks.{i}.attn.proj.weight"] = tensor[n + i]
         elif name == "kv_bank":
             for i in range(n):
-                out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
-                out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
+                out[f"shared_blocks.{i}.attn.c_k.weight"] = tensor[i]
+                out[f"shared_blocks.{i}.attn.c_v.weight"] = tensor[n + i]
         elif name == "mlp_up_bank":
             for i in range(n):
-                out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
+                out[f"shared_blocks.{i}.mlp.fc.weight"] = tensor[i]
         elif name == "mlp_down_bank":
             for i in range(n):
-                out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
+                out[f"shared_blocks.{i}.mlp.proj.weight"] = tensor[i]
         else:
             out[name] = tensor
     return out
 
-def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
-    """Convert individual 2D tensors back into 3D bank tensors."""
+def _rebank_state_dict(sd: dict[str, Tensor], template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Convert individual shared 2D tensors back into 3D bank tensors."""
     out: dict[str, Tensor] = {}
-    n = num_layers
+    n = _shared_bank_count(template_sd)
     # Reconstruct banks from individual weight keys
     qo_slices = [None] * (2 * n)
     kv_slices = [None] * (2 * n)
@@ -1294,27 +1310,27 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
     down_slices = [None] * n
     consumed = set()
     for i in range(n):
-        qk = f"blocks.{i}.attn.c_q.weight"
+        qk = f"shared_blocks.{i}.attn.c_q.weight"
         if qk in sd:
             qo_slices[i] = sd[qk]
             consumed.add(qk)
-        ok = f"blocks.{i}.attn.proj.weight"
+        ok = f"shared_blocks.{i}.attn.proj.weight"
         if ok in sd:
             qo_slices[n + i] = sd[ok]
             consumed.add(ok)
-        kk = f"blocks.{i}.attn.c_k.weight"
+        kk = f"shared_blocks.{i}.attn.c_k.weight"
         if kk in sd:
             kv_slices[i] = sd[kk]
             consumed.add(kk)
-        vk = f"blocks.{i}.attn.c_v.weight"
+        vk = f"shared_blocks.{i}.attn.c_v.weight"
         if vk in sd:
             kv_slices[n + i] = sd[vk]
             consumed.add(vk)
-        fk = f"blocks.{i}.mlp.fc.weight"
+        fk = f"shared_blocks.{i}.mlp.fc.weight"
         if fk in sd:
             up_slices[i] = sd[fk]
             consumed.add(fk)
-        dk = f"blocks.{i}.mlp.proj.weight"
+        dk = f"shared_blocks.{i}.mlp.proj.weight"
         if dk in sd:
             down_slices[i] = sd[dk]
             consumed.add(dk)
@@ -1479,6 +1495,7 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        shared_depth_cores=args.shared_depth_cores,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1571,6 +1588,8 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
+    shared_map = [base_model._shared_layer_idx(i) for i in range(base_model.num_layers)]
+    log0(f"shared_depth_cores:{base_model.num_shared_layers} layer_to_core:{shared_map}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
@@ -1785,9 +1804,9 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
-    # Unbank 3D tensors into individual 2D tensors for quantization
+    # Unbank shared 3D tensors into shared 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
+    unbanked_sd = _unbank_state_dict(sd_cpu)
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
@@ -1810,7 +1829,7 @@ def main() -> None:
     )
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
     # Re-bank the dequantized tensors
-    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
+    deq_state = _rebank_state_dict(deq_unbanked, sd_cpu)
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
@@ -1822,6 +1841,7 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        shared_depth_cores=args.shared_depth_cores,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
