@@ -90,6 +90,7 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    shared_delta_rank = int(os.environ.get("SHARED_DELTA_RANK", 8))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
@@ -364,7 +365,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,layer_scale",
     ).split(",")
     if pattern
 )
@@ -729,6 +730,59 @@ class MLP(nn.Module):
         x = F.leaky_relu(F.linear(x, up_w.to(x.dtype)), negative_slope=0.5)
         return F.linear(x.square(), down_w.to(x.dtype))
 
+class SharedDeltaBank(nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        out_dim: int,
+        in_dim: int,
+        group_ids: list[int],
+        delta_rank: int,
+        init_mode: str,
+    ):
+        super().__init__()
+        if len(group_ids) != num_layers:
+            raise ValueError(f"group_ids must have {num_layers} entries, got {len(group_ids)}")
+        num_groups = max(group_ids, default=0) + 1
+        self.delta_rank = delta_rank
+        self.init_mode = init_mode
+        self.shared_bank = nn.Parameter(torch.empty(num_groups, out_dim, in_dim))
+        self.layer_scale = nn.Parameter(torch.ones(num_layers, dtype=torch.float32))
+        if delta_rank > 0:
+            self.delta_left = nn.Parameter(torch.zeros(num_layers, out_dim, delta_rank))
+            self.delta_right = nn.Parameter(torch.zeros(num_layers, delta_rank, in_dim))
+        else:
+            self.register_parameter("delta_left", None)
+            self.register_parameter("delta_right", None)
+        self.register_buffer("group_ids", torch.tensor(group_ids, dtype=torch.long), persistent=False)
+
+    def reset_parameters(self) -> None:
+        if self.init_mode == "orthogonal":
+            for weight in self.shared_bank:
+                nn.init.orthogonal_(weight, gain=1.0)
+        elif self.init_mode == "zero":
+            nn.init.zeros_(self.shared_bank)
+        else:
+            raise ValueError(f"Unknown SharedDeltaBank init_mode={self.init_mode}")
+        nn.init.ones_(self.layer_scale)
+        if self.delta_left is not None:
+            nn.init.zeros_(self.delta_left)
+            nn.init.zeros_(self.delta_right)
+
+    def materialize(self) -> Tensor:
+        base = self.shared_bank.index_select(0, self.group_ids)
+        bank = base * self.layer_scale[:, None, None].to(dtype=base.dtype)
+        if self.delta_left is not None:
+            bank = torch.baddbmm(bank, self.delta_left, self.delta_right)
+        return bank
+
+    def force_fp32_(self) -> None:
+        self.shared_bank.data = self.shared_bank.data.float()
+        self.layer_scale.data = self.layer_scale.data.float()
+        if self.delta_left is not None:
+            self.delta_left.data = self.delta_left.data.float()
+            self.delta_right.data = self.delta_right.data.float()
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -798,6 +852,7 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        shared_delta_rank: int = 8,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -821,10 +876,13 @@ class GPT(nn.Module):
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
         self.num_layers = num_layers
-        self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
-        self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
-        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        stage_ids = [0] * self.num_encoder_layers + [1] * self.num_decoder_layers
+        self.q_bank = SharedDeltaBank(num_layers, model_dim, model_dim, stage_ids, shared_delta_rank, init_mode="orthogonal")
+        self.k_bank = SharedDeltaBank(num_layers, kv_dim, model_dim, stage_ids, shared_delta_rank, init_mode="orthogonal")
+        self.v_bank = SharedDeltaBank(num_layers, kv_dim, model_dim, stage_ids, shared_delta_rank, init_mode="orthogonal")
+        self.o_bank = SharedDeltaBank(num_layers, model_dim, model_dim, stage_ids, shared_delta_rank, init_mode="zero")
+        self.mlp_up_bank = SharedDeltaBank(num_layers, mlp_dim, model_dim, stage_ids, shared_delta_rank, init_mode="orthogonal")
+        self.mlp_down_bank = SharedDeltaBank(num_layers, model_dim, mlp_dim, stage_ids, shared_delta_rank, init_mode="zero")
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -872,22 +930,25 @@ class GPT(nn.Module):
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
         self._init_weights()
+
+    def bank_modules(self) -> tuple[SharedDeltaBank, ...]:
+        return (
+            self.q_bank,
+            self.k_bank,
+            self.v_bank,
+            self.o_bank,
+            self.mlp_up_bank,
+            self.mlp_down_bank,
+        )
+
+    def _materialize_banks(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        return tuple(bank.materialize() for bank in self.bank_modules())
+
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        n = self.num_layers
-        proj_scale = 1.0 / math.sqrt(2 * n)
-        # Init banks: orthogonal, with proj layers scaled down and out/down zero-init
-        for i in range(n):
-            nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)        # Q
-            nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
-            nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
-            nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
-            nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
-            # Scale proj layers (out_proj and mlp_down are "proj" layers)
-            self.qo_bank.data[n + i].mul_(proj_scale)
-            self.mlp_down_bank.data[i].mul_(proj_scale)
+        for bank in self.bank_modules():
+            bank.reset_parameters()
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -905,7 +966,7 @@ class GPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        n = self.num_layers
+        q_bank, k_bank, v_bank, o_bank, up_bank, down_bank = self._materialize_banks()
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -918,8 +979,8 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                q_bank[i], k_bank[i], v_bank[i],
+                o_bank[i], up_bank[i], down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -930,8 +991,8 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                q_bank[bi], k_bank[bi], v_bank[bi],
+                o_bank[bi], up_bank[bi], down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -963,7 +1024,7 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
-        n = self.num_layers
+        q_bank, k_bank, v_bank, o_bank, up_bank, down_bank = self._materialize_banks()
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -976,8 +1037,8 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                q_bank[i], k_bank[i], v_bank[i],
+                o_bank[i], up_bank[i], down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
@@ -988,8 +1049,8 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
             x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                q_bank[bi], k_bank[bi], v_bank[bi],
+                o_bank[bi], up_bank[bi], down_bank[bi],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1234,6 +1295,10 @@ def eval_val_sliding_ttt(
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
+    if any(tag in name for tag in ("q_bank.", "k_bank.", "v_bank.", "o_bank.")):
+        return "attn"
+    if "mlp_up_bank." in name or "mlp_down_bank." in name:
+        return "mlp"
     if ".mlp." in name:
         return "mlp"
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
@@ -1318,10 +1383,14 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
         if dk in sd:
             down_slices[i] = sd[dk]
             consumed.add(dk)
-    out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
-    out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
-    out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
-    out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
+    if "qo_bank" in template_sd and all(t is not None for t in qo_slices):
+        out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
+    if "kv_bank" in template_sd and all(t is not None for t in kv_slices):
+        out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
+    if "mlp_up_bank" in template_sd and all(t is not None for t in up_slices):
+        out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
+    if "mlp_down_bank" in template_sd and all(t is not None for t in down_slices):
+        out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
     for name, tensor in sd.items():
         if name not in consumed:
             out[name] = tensor
@@ -1479,12 +1548,11 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        shared_delta_rank=args.shared_delta_rank,
     ).to(device).bfloat16()
-    # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
-    base_model.qo_bank.data = base_model.qo_bank.data.float()
-    base_model.kv_bank.data = base_model.kv_bank.data.float()
-    base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
-    base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+    # Shared bank templates and low-rank deltas stay FP32, cast to BF16 in forward
+    for bank in base_model.bank_modules():
+        bank.force_fp32_()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1499,16 +1567,18 @@ def main() -> None:
     # - token embedding -> Adam
     # - scalars/control tensors -> Adam
     # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
-    matrix_params = [
-        base_model.qo_bank, base_model.kv_bank,
-        base_model.mlp_up_bank, base_model.mlp_down_bank,
-    ]
+    matrix_params = [bank.shared_bank for bank in base_model.bank_modules()]
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
         p
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    delta_params = []
+    for bank in base_model.bank_modules():
+        scalar_params.append(bank.layer_scale)
+        if bank.delta_left is not None:
+            delta_params.extend([bank.delta_left, bank.delta_right])
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
@@ -1519,11 +1589,11 @@ def main() -> None:
     if base_model.bigram is not None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
-            scalar_params.append(base_model.bigram.proj.weight)
+            delta_params.append(base_model.bigram.proj.weight)
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
-            scalar_params.append(base_model.ve_shared.proj.weight)
+            delta_params.append(base_model.ve_shared.proj.weight)
         scalar_params.append(base_model.ve_shared.scale)
         for s in base_model.ve_layer_scales:
             scalar_params.append(s)
@@ -1543,8 +1613,13 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    scalar_groups = []
+    if scalar_params:
+        scalar_groups.append({"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr})
+    if delta_params:
+        scalar_groups.append({"params": delta_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr})
     optimizer_scalar = torch.optim.AdamW(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+        scalar_groups,
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         weight_decay=args.adam_wd,
@@ -1555,6 +1630,7 @@ def main() -> None:
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
+    replicated_params.extend(delta_params)
 
     optimizer_head = None
     if base_model.lm_head is not None:
@@ -1582,6 +1658,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(f"shared_delta_rank:{args.shared_delta_rank}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1822,11 +1899,10 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        shared_delta_rank=args.shared_delta_rank,
     ).to(device).bfloat16()
-    eval_model.qo_bank.data = eval_model.qo_bank.data.float()
-    eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-    eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
-    eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+    for bank in eval_model.bank_modules():
+        bank.force_fp32_()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()
