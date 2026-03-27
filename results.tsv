@@ -1,1 +1,12 @@
 commit	val_bpb	memory_gb	status	description
+1759d38	2.83381057	5.6	discard	Low-rank adapters for legal TTT
+44afd54	2.34274022	5.5	keep	baseline 30m branch parameter-golf/2026-03-25-baseline-30m
+62e86d2	2.48771121	5.2	discard	Shared banked depth cores across layers
+74008fb	1.88806554	4.8	keep	SwiGLU MLP banks at fixed parameter budget
+77cfe73	2.83776918	5.6	discard	Decoder summary memory residual
+7fd0b74	1.74037457	5.2	keep	Stage-shared banks with low-rank deltas
+86effba	5.53727544	6.2	discard	Banked causal FIR token mixer
+94b1edf	2.81875413	5.5	discard	Dual n-gram hash embedding
+a1d9e61	2.73925295	5.8	discard	Gated rotary frequency controls
+d47cbbf	7.31455867	6.1	discard	Grouped attention value mixer
+f5f3843	3.73698226	7.3	discard	Per-token residual and skip routing
