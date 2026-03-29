@@ -1,7 +1,0 @@
-commit	val_bpb	memory_gb	status	description
-334a397	0.00000000	5.5	discard	Size rebalance for bigram, VE, and TTT
-8e8bb1d	0.00000000	5.4	discard	Disable MTP heads by default
-9084b39	2.34274022	5.5	keep	baseline 30m branch parameter-golf/2026-03-25-baseline-30m
-9c0a1fa	0.00000000	5.5	discard	EMA schedule and sliding-eval controls
-abef41c	0.00000000	5.5	discard	EMA controls with mixed int6 selection
-f894bba	0.00000000	5.4	discard	Bigram retune plus configurable EMA

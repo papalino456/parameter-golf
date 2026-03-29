@@ -46,17 +46,6 @@ VAL_PATTERNS = [
 MEM_PATTERN = re.compile(r"peak memory allocated: (\d+) MiB")
 
 
-def ensure_local_assets() -> None:
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(f"Missing local dataset directory: {DATA_PATH}")
-    if not any(DATA_PATH.glob("fineweb_train_*.bin")):
-        raise FileNotFoundError(f"Missing training shards under: {DATA_PATH}")
-    if not any(DATA_PATH.glob("fineweb_val_*.bin")):
-        raise FileNotFoundError(f"Missing validation shards under: {DATA_PATH}")
-    if not TOKENIZER_PATH.exists():
-        raise FileNotFoundError(f"Missing local tokenizer model: {TOKENIZER_PATH}")
-
-
 def git(*args: str, cwd: Path | None = None) -> str:
     proc = subprocess.run(
         ["git", *args],
@@ -144,11 +133,6 @@ def run_experiment(exp: Experiment, baseline_bpb: float) -> tuple[str, float | N
             "RUN_ID": f"round2_{exp.slug}",
             "DATA_PATH": str(DATA_PATH),
             "TOKENIZER_PATH": str(TOKENIZER_PATH),
-            "HF_HUB_OFFLINE": "1",
-            "HF_DATASETS_OFFLINE": "1",
-            "TRANSFORMERS_OFFLINE": "1",
-            "HF_HUB_DISABLE_TELEMETRY": "1",
-            "PYTHONUNBUFFERED": "1",
             "TORCHDYNAMO_DISABLE": "1",
             "TRAIN_BATCH_TOKENS": "131072",
             "VAL_BATCH_SIZE": "65536",
@@ -162,10 +146,8 @@ def run_experiment(exp: Experiment, baseline_bpb: float) -> tuple[str, float | N
     with log_path.open("w", encoding="utf-8") as handle:
         handle.write(
             f"# branch={exp.branch}\n# commit={commit}\n# description={exp.description}\n"
-            f"# data_path={DATA_PATH}\n# tokenizer_path={TOKENIZER_PATH}\n"
-            "# env: HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "
-            "PYTHONUNBUFFERED=1 TORCHDYNAMO_DISABLE=1 TRAIN_BATCH_TOKENS=131072 "
-            "VAL_BATCH_SIZE=65536 VAL_LOSS_EVERY=0 MAX_WALLCLOCK_SECONDS=1800 EVAL_STRIDE=0\n\n"
+            "# env: TORCHDYNAMO_DISABLE=1 TRAIN_BATCH_TOKENS=131072 VAL_BATCH_SIZE=65536 "
+            "VAL_LOSS_EVERY=0 MAX_WALLCLOCK_SECONDS=1800 EVAL_STRIDE=0\n\n"
         )
         handle.flush()
         try:
@@ -242,7 +224,6 @@ def write_summary(
 def main() -> int:
     if not VENV_PYTHON.exists():
         raise FileNotFoundError(f"Missing venv python: {VENV_PYTHON}")
-    ensure_local_assets()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     baseline_commit, baseline_bpb = ensure_baseline()
     completed: list[tuple[Experiment, str, float | None, float, str]] = []
