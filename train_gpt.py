@@ -1264,6 +1264,37 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
 
+def pack_int6_tensor(q: Tensor) -> Tensor:
+    flat = q.detach().cpu().to(torch.int16).reshape(-1)
+    if flat.numel() == 0:
+        return torch.empty(0, dtype=torch.uint8)
+    values = (flat + 32).to(torch.uint8)
+    pad = (-values.numel()) % 4
+    if pad:
+        values = torch.cat([values, torch.zeros(pad, dtype=torch.uint8)])
+    groups = values.view(-1, 4).to(torch.int32)
+    packed = torch.empty(groups.size(0) * 3, dtype=torch.uint8)
+    packed[0::3] = (groups[:, 0] | ((groups[:, 1] & 0x03) << 6)).to(torch.uint8)
+    packed[1::3] = (((groups[:, 1] >> 2) & 0x0F) | ((groups[:, 2] & 0x0F) << 4)).to(torch.uint8)
+    packed[2::3] = (((groups[:, 2] >> 4) & 0x03) | (groups[:, 3] << 2)).to(torch.uint8)
+    return packed
+
+def unpack_int6_tensor(packed: Tensor, shape: torch.Size) -> Tensor:
+    flat = packed.detach().cpu().to(torch.uint8).reshape(-1)
+    if flat.numel() == 0:
+        return torch.empty(shape, dtype=torch.int8)
+    groups = flat.to(torch.int32).view(-1, 3)
+    values = torch.stack(
+        (
+            groups[:, 0] & 0x3F,
+            ((groups[:, 0] >> 6) | ((groups[:, 1] & 0x0F) << 2)) & 0x3F,
+            ((groups[:, 1] >> 4) | ((groups[:, 2] & 0x03) << 4)) & 0x3F,
+            (groups[:, 2] >> 2) & 0x3F,
+        ),
+        dim=1,
+    ).reshape(-1)
+    return (values[:math.prod(shape)].to(torch.int16) - 32).to(torch.int8).view(shape)
+
 def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
     """Convert 3D bank tensors into individual 2D tensors with standard names."""
     out: dict[str, Tensor] = {}
@@ -1352,9 +1383,9 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             continue
         if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
-            result[name + ".q"] = q
+            result[name + ".q"] = pack_int6_tensor(q)
             result[name + ".scale"] = s
-            meta[name] = {"type": "int6"}
+            meta[name] = {"type": "int6_packed_v1"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -1376,11 +1407,82 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             out[name] = t
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
+        if isinstance(info, dict) and info.get("type") == "int6_packed_v1":
+            q = unpack_int6_tensor(q, orig.shape)
         if s.ndim > 0:
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
         else:
             out[name] = (q.float() * float(s.item())).to(orig_dtype)
     return out
+
+def build_grad_allreduce_buckets(params: list[Tensor], bucket_cap_mb: int = 32) -> list[dict[str, object]]:
+    unique_params: list[Tensor] = []
+    seen: set[int] = set()
+    for p in params:
+        if id(p) in seen:
+            continue
+        seen.add(id(p))
+        unique_params.append(p)
+    bucket_cap_bytes = bucket_cap_mb * 1024 * 1024
+    buckets: list[dict[str, object]] = []
+    entries: list[tuple[Tensor, int, int]] = []
+    total_numel = 0
+    current_dtype: torch.dtype | None = None
+    current_device: torch.device | None = None
+    def flush() -> None:
+        nonlocal entries, total_numel, current_dtype, current_device
+        if not entries or current_dtype is None or current_device is None:
+            entries = []
+            total_numel = 0
+            current_dtype = None
+            current_device = None
+            return
+        buckets.append({
+            "buffer": torch.empty(total_numel, device=current_device, dtype=current_dtype),
+            "entries": entries,
+        })
+        entries = []
+        total_numel = 0
+        current_dtype = None
+        current_device = None
+    for p in unique_params:
+        dtype = p.dtype
+        device = p.device
+        param_bytes = p.numel() * p.element_size()
+        if entries and (
+            dtype != current_dtype
+            or device != current_device
+            or total_numel * p.element_size() + param_bytes > bucket_cap_bytes
+        ):
+            flush()
+        start = total_numel
+        total_numel += p.numel()
+        entries.append((p, start, total_numel))
+        current_dtype = dtype
+        current_device = device
+    flush()
+    return buckets
+
+def all_reduce_grad_buckets(buckets: list[dict[str, object]]) -> None:
+    for bucket in buckets:
+        flat = bucket["buffer"]
+        entries = bucket["entries"]
+        assert isinstance(flat, Tensor)
+        assert isinstance(entries, list)
+        active = False
+        flat.zero_()
+        for p, start, end in entries:
+            if p.grad is None:
+                continue
+            flat[start:end].copy_(p.grad.reshape(-1))
+            active = True
+        if not active:
+            continue
+        dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+        for p, start, end in entries:
+            if p.grad is None:
+                continue
+            p.grad.reshape(-1).copy_(flat[start:end])
 
 # --- Training ---
 
@@ -1569,6 +1671,7 @@ def main() -> None:
             fused=True,
         )
         replicated_params.append(base_model.lm_head.weight)
+    replicated_grad_buckets = build_grad_allreduce_buckets(replicated_params) if distributed else []
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
@@ -1579,6 +1682,7 @@ def main() -> None:
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"replicated_grad_buckets:{len(replicated_grad_buckets)}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
@@ -1703,9 +1807,7 @@ def main() -> None:
         optimizer_muon.launch_reduce_scatters()
         # Phase 2: All-reduce non-bank grads + step Adam (while bank RS is in-flight)
         if distributed:
-            for p in replicated_params:
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+            all_reduce_grad_buckets(replicated_grad_buckets)
         optimizer_tok.step()
         optimizer_scalar.step()
         if optimizer_head is not None:
